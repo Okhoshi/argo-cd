@@ -1086,11 +1086,15 @@ type objKeyLiveTarget struct {
 // NewApplicationDiffCommand returns a new instance of an `argocd app diff` command
 func NewApplicationDiffCommand(clientOpts *argocdclient.ClientOptions) *cobra.Command {
 	var (
-		refresh       bool
-		hardRefresh   bool
-		local         string
-		revision      string
-		localRepoRoot string
+		refresh           bool
+		hardRefresh       bool
+		appManifest       string
+		local             string
+		revision          string
+		localRepoRoot     string
+		repoServerAddress string
+		namespace         string
+		sshPrivateKeyPath string
 	)
 	shortDesc := "Perform a diff against the target and live state."
 	var command = &cobra.Command{
@@ -1120,7 +1124,72 @@ func NewApplicationDiffCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 			argoSettings, err := settingsIf.Get(context.Background(), &settingspkg.SettingsQuery{})
 			errors.CheckError(err)
 
-			if local != "" {
+			if appManifest != "" {
+				//app, err := cmdutil.ConstructApp(appManifest, "", []string{}, []string{}, cmdutil.AppOptions{}, &pflag.FlagSet{})
+				//errors.CheckError(err)
+
+				parsedURL, err := url.ParseRequestURI(appManifest)
+				if err != nil || !(parsedURL.Scheme == "http" || parsedURL.Scheme == "https") {
+					err = config.UnmarshalLocalFile(appManifest, &app)
+				} else {
+					err = config.UnmarshalRemoteFile(appManifest, &app)
+				}
+				errors.CheckError(err)
+				if len(args) == 1 && args[0] != app.Name {
+					log.Fatalf("app name '%s' does not match app spec metadata.name '%s'", args[0], app.Name)
+				}
+				if appName != "" && appName != app.Name {
+					app.Name = appName
+				}
+				if app.Name == "" {
+					log.Fatalf("app.Name is empty. --name argument can be used to provide app.Name")
+				}
+
+				conn, clusterIf := clientset.NewClusterClientOrDie()
+				defer argoio.Close(conn)
+				cluster, err := clusterIf.Get(context.Background(), &clusterpkg.ClusterQuery{Name: app.Spec.Destination.Name, Server: app.Spec.Destination.Server})
+				errors.CheckError(err)
+
+				if repoServerAddress == "" {
+					fmt.Println("Repo server is not provided, trying to port-forward to argocd-repo-server pod.")
+					repoServerPort, err := argokube.PortForward("app.kubernetes.io/name=argocd-repo-server", 8081, namespace)
+					errors.CheckError(err)
+					repoServerAddress = fmt.Sprintf("localhost:%d", repoServerPort)
+				}
+				repoServerClient := repoapiclient.NewRepoServerClientset(repoServerAddress, 60)
+
+				conn, client, err := repoServerClient.NewRepoServerClient()
+				errors.CheckError(err)
+				defer argoio.Close(conn)
+
+				keyData, err := ioutil.ReadFile(sshPrivateKeyPath)
+				if err != nil {
+					log.Fatal(err)
+				}
+
+				var unstructureds []*unstructured.Unstructured
+				res, err := client.GenerateManifest(context.Background(), &repoapiclient.ManifestRequest{
+					Repo: &argoappv1.Repository{
+						Repo:          app.Spec.Source.RepoURL,
+						SSHPrivateKey: string(keyData),
+					},
+					AppLabelKey:       argoSettings.AppLabelKey,
+					AppLabelValue:     app.Name,
+					Namespace:         app.Spec.Destination.Namespace,
+					ApplicationSource: &app.Spec.Source,
+					KustomizeOptions:  argoSettings.KustomizeOptions,
+					KubeVersion:       cluster.ServerVersion,
+					Plugins:           argoSettings.ConfigManagementPlugins,
+				})
+				errors.CheckError(err)
+				for _, mfst := range res.Manifests {
+					obj, err := argoappv1.UnmarshalToUnstructured(mfst)
+					errors.CheckError(err)
+					unstructureds = append(unstructureds, obj)
+				}
+				groupedObjs := groupObjsByKey(unstructureds, liveObjs, app.Spec.Destination.Namespace)
+				items = groupObjsForDiff(resources, groupedObjs, items, argoSettings, appName)
+			} else if local != "" {
 				conn, clusterIf := clientset.NewClusterClientOrDie()
 				defer argoio.Close(conn)
 				cluster, err := clusterIf.Get(context.Background(), &clusterpkg.ClusterQuery{Name: app.Spec.Destination.Name, Server: app.Spec.Destination.Server})
@@ -1199,9 +1268,13 @@ func NewApplicationDiffCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 	}
 	command.Flags().BoolVar(&refresh, "refresh", false, "Refresh application data when retrieving")
 	command.Flags().BoolVar(&hardRefresh, "hard-refresh", false, "Refresh application data as well as target manifests cache")
+	command.Flags().StringVar(&appManifest, "app", "", "Compare live app to a local app manifest")
 	command.Flags().StringVar(&local, "local", "", "Compare live app to a local manifests")
 	command.Flags().StringVar(&revision, "revision", "", "Compare live app to a particular revision")
+	command.Flags().StringVar(&namespace, "namespace", "argocd", "Namespace for repo server. Used together with --app allows setting the repo server namespace to create port forwarding")
+	command.Flags().StringVar(&repoServerAddress, "repo-server", "", "Repo server address. Used together with --app allows setting the repo server address")
 	command.Flags().StringVar(&localRepoRoot, "local-repo-root", "/", "Path to the repository root. Used together with --local allows setting the repository root")
+	command.Flags().StringVar(&sshPrivateKeyPath, "ssh-private-key-path", "", "path to the private ssh key (e.g. ~/.ssh/id_rsa)")
 	return command
 }
 
